@@ -174,7 +174,9 @@ def gen_config_file(config_path: str,
             'pipeline_parallel_size': 1,
             'print_iter_log': True,
             'disable_overlap_scheduler': True,
-            'kv_cache_dtype': 'fp8',
+            'kv_cache_config': {
+                'dtype': 'fp8'
+            },
             'cache_transceiver_config': {
                 'backend': 'default',
                 'max_tokens_in_buffer': 8320,
@@ -195,7 +197,9 @@ def gen_config_file(config_path: str,
                 'batch_sizes': gen_cuda_graph_batch_sizes,
             },
             'print_iter_log': True,
-            'kv_cache_dtype': 'fp8',
+            'kv_cache_config': {
+                'dtype': 'fp8'
+            },
             'moe_config': {
                 'backend': 'TRTLLM',
             },

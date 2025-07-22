@@ -96,7 +96,7 @@ srun -l --container-name=${container_name} \
 srun -l --container-name=${container_name} \
         --container-mounts=${mount_dir}:${mount_dir} \
         --mpi=pmix --overlap -N 1 -n 1 \
-        bash trtllm-serve disaggregated -c ${full_logdir}/config.yaml -t 1800 -r 1800 &> ${full_logdir}/output_server.log &
+        trtllm-serve disaggregated -c ${full_logdir}/config.yaml -t 1800 -r 1800 &> ${full_logdir}/output_server.log &
 # start benchmark
 srun -l --container-name=${container_name} \
         --container-mounts=${mount_dir}:${mount_dir} \
