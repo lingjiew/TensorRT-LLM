@@ -278,6 +278,13 @@ struct BatchedGemmData
         // Shape is [B].
         float const* mPtrScaleC{nullptr};
 
+        // The pre-activation scaling factor (typically dequantA * dequantB) for non-gated non-linear
+        // activation.
+        // Only used when non-linear activation is applied (e.g., GELU, Relu2).
+        // When used, scaleC should be quantScaleC only, and this scale is applied before the
+        // activation. Shape is [B].
+        float const* mPtrScaleAct{nullptr};
+
         // The output gate scale for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
         // scaleGate = dequantA * dequantB,
@@ -379,7 +386,8 @@ struct BatchedGemmData
         // Computed as
         // int32_t totalNumPaddedTokens{0};
         // for (int bi = 0; bi < options.mNumBatches; bi++) {
-        //   totalNumPaddedTokens += batchM ? divUpMul(options.mBatchedM[bi], options.mTileM)
+        //   totalNumPaddedTokens += batchM ? divUpMul(options.mBatchedM[bi], options.mTileM *
+        //   options.mClusterDimX)
         //                                  : divUpMul(options.mBatchedN[bi], options.mTileN);
         // }
         // The size is 1 and the dtype is int32_t.
@@ -533,22 +541,22 @@ public:
 
         auto [numCtaBatch, numCtaTile, numCtaInner]
             = getGridDim(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+
         auto kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
             batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
             batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,
             batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
             batchedGemmData.mInputBuffers.mPtrBias, batchedGemmData.mOutputBuffers.mPtrSfC,
-            batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleGate,
-            batchedGemmData.mInputBuffers.mPtrClampLimit, batchedGemmData.mInputBuffers.mPtrGatedActAlpha,
-            batchedGemmData.mInputBuffers.mPtrGatedActBeta, batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax,
-            dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
-            batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
+            batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleAct,
+            batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrClampLimit,
+            batchedGemmData.mInputBuffers.mPtrGatedActAlpha, batchedGemmData.mInputBuffers.mPtrGatedActBeta,
+            batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
+            batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
             batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
             numCtaBatch);
 
         // The size of the grid.
-        std::vector<int32_t> grid = batchM ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
-                                           : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
+        auto grid = getLaunchGrid(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
 
         BatchedGemmConfig batchedGemmConfig = config;
 #ifndef TLLM_GEN_EXPORT_INTERFACE
@@ -690,8 +698,9 @@ public:
         {
             for (int32_t bi = 0; bi < options.mNumBatches; ++bi)
             {
-                numCtasBatch += batchM ? gemm::divUp(options.mBatchedM[bi], options.mTileM)
-                                       : gemm::divUp(options.mBatchedN[bi], options.mTileN);
+                numCtasBatch += batchM
+                    ? gemm::divUp(options.mBatchedM[bi], options.mTileM * options.mClusterDimX) * options.mClusterDimX
+                    : gemm::divUp(options.mBatchedN[bi], options.mTileN);
             }
         }
         // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
@@ -734,11 +743,24 @@ public:
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
     // Returns the number of CTAs of the current kernel.
+    std::vector<int32_t> getLaunchGrid(
+        BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
+    {
+        auto [numCtaBatch, numCtaTile, numCtaInner] = getGridDim(options, maxNumCtasInBatchDim);
+        bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
+        std::vector<int32_t> grid = batchM ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
+                                           : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
+        return grid;
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Returns the number of CTAs of the current kernel.
     int32_t getNumCtas(
         BatchedGemmOptions const& options, std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const
     {
-        auto [numCtasBatch, numCtasTile, numCtasInner] = getGridDim(options, maxNumCtasInBatchDim);
-        return numCtasBatch * numCtasTile * numCtasInner;
+        auto grid = getLaunchGrid(options, maxNumCtasInBatchDim);
+        return grid[0] * grid[1] * grid[2];
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -807,21 +829,22 @@ private:
             {
                 for (int32_t bi = 0; bi < options.mNumBatches; ++bi)
                 {
-                    totalNumPaddedTokens += batchM ? gemm::divUpMul(options.mBatchedM[bi], options.mTileM)
-                                                   : gemm::divUpMul(options.mBatchedN[bi], options.mTileN);
+                    totalNumPaddedTokens += batchM
+                        ? gemm::divUpMul(options.mBatchedM[bi], options.mTileM * options.mClusterDimX)
+                        : gemm::divUpMul(options.mBatchedN[bi], options.mTileN);
                 }
             }
             else
             {
                 // Get tile in token dim.
-                auto tileTokensDim = batchM ? options.mTileM : options.mTileN;
+                auto tileTokensDim = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
                 totalNumPaddedTokens = data.mProblemDimensions.mMaxNumCtasInTokenDim * tileTokensDim;
             }
 
             // Get options from config.
             auto& options = config.mOptions;
 
-            int const tokenTile = batchM ? options.mTileM : options.mTileN;
+            int const tokenTile = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
 
             auto const numTokens = totalNumPaddedTokens;
             auto const intermediateDim = batchM ? options.mN : options.mM;

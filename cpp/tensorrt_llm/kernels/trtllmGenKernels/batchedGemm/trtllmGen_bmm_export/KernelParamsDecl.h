@@ -210,6 +210,13 @@ struct KernelParams
     // Shape is [B]. One scaling factor per tensor in batch.
     float const* ptrScaleC{nullptr};
 
+    // The pre-activation scaling factor (typically dequantA * dequantB) for non-gated non-linear
+    // activation.
+    // Only used when non-linear activation is applied (e.g., GELU, Relu2).
+    // When used, scaleC should be quantScaleC only, and this scale is applied before the
+    // activation. Shape is [B].
+    float const* ptrScaleAct{nullptr};
+
     // The output gate scale for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
     // TensorRT-LLM API requires a scaling factor on the device.
     // Shape is [B]. One scaling factor per tensor in batch.
