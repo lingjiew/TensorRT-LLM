@@ -443,4 +443,4 @@ class Mamba2Mixer(nn.Module):
         # out_proj
         out = self.out_proj(out)
 
-        return out
+        return out[:num_actual_tokens]
