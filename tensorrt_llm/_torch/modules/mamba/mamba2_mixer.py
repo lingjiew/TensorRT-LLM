@@ -13,13 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
 import torch
 from einops import rearrange, repeat
+from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...attention_backend import AttentionMetadata
@@ -27,7 +30,8 @@ from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .layernorm_gated import RMSNorm as RMSNormGated
-from .selective_state_update import selective_state_update
+from .selective_state_update import \
+    selective_state_update as selective_state_update_native
 from .ssd_combined import mamba_chunk_scan_combined
 
 
@@ -127,16 +131,29 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
+        # Choose between flashinfer and native implementation.
+        self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
+        if os.environ.get("TLLM_USE_FLASHINFER_SELECTIVE_STATE_UPDATE",
+                          "1").lower() in ["1", "y", "yes", "true"]:
+            self.selective_state_update_func = selective_state_update_fi
+            # TODO: Use the same weight dtype as triton. For now, use bfloat16 to avoid garbage outputs.
+            _weight_dtype = torch.bfloat16
+        else:
+            logger.info_once("Using native for selective state update",
+                             key="selective_state_update")
+            self.selective_state_update_func = selective_state_update_native
+            _weight_dtype = torch.float32
+
         # D
         self.D = nn.Parameter(
             torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
+                        dtype=_weight_dtype,
                         requires_grad=False))
 
         # dt_bias
         self.dt_bias = nn.Parameter(
             torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
+                        dtype=_weight_dtype,
                         requires_grad=False))
 
         # norm
@@ -159,8 +176,6 @@ class Mamba2Mixer(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy)
-
-        self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
 
     def forward(
         self,
@@ -293,7 +308,7 @@ class Mamba2Mixer(nn.Module):
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
             D = repeat(self.D, "h -> h p", p=self.head_dim)
 
-            y = selective_state_update(
+            y = self.selective_state_update_func(
                 ssm_states,
                 x_d,
                 dt_d,
