@@ -53,7 +53,7 @@ ordered-set
 peft
 patchelf
 einops
-flashinfer-python~=0.6.0
+flashinfer-python @ https://github.com/flashinfer-ai/flashinfer/releases/download/nightly-v0.6.1-20260121/flashinfer_python-0.6.1.dev20260121-py3-none-any.whl
 opencv-python-headless
 xgrammar==0.1.25
 llguidance==0.7.29
