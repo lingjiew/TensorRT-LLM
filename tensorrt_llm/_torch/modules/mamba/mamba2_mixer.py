@@ -222,7 +222,7 @@ class Mamba2Mixer(nn.Module):
         z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
         xbc_p, xbc_d = torch.split(xbc, seqlen_split_size, dim=0)
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
-       
+
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
         preallocated_ssm_out = torch.empty(
@@ -239,7 +239,7 @@ class Mamba2Mixer(nn.Module):
             dim=0,
         )
         if self.use_flashinfer_selective_state_update:
-            out = []
+            z_for_norm_p = z_p
 
         if num_prefills > 0:
 
@@ -414,7 +414,7 @@ class Mamba2Mixer(nn.Module):
                         dt_softplus=self.delta_softplus,
                         state_batch_indices=state_indices_d,
                     )
-            
+
                 else:
                     selective_state_update_native(
                         ssm_states,
@@ -433,13 +433,12 @@ class Mamba2Mixer(nn.Module):
                     )
         if self.use_flashinfer_selective_state_update:
             # merge prefill and decode outputs
-            p_norm = self.norm(preallocated_ssm_out_p, z_p)
+            p_norm = self.norm(preallocated_ssm_out_p, z_for_norm_p)
             d_norm = self.norm(self.fi_selective_state_update_y)
-            out = torch.cat([p_norm, d_norm], dim=1)
+            out = torch.cat([p_norm, d_norm], dim=0)
         else:
             out = self.norm(preallocated_ssm_out, z[:num_actual_tokens])
 
-        
         # out_proj
         out = self.out_proj(out)
 
