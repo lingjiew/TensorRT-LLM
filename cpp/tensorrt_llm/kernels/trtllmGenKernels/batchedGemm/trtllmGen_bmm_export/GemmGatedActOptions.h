@@ -83,6 +83,8 @@ enum class ActType
     // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
     // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
     GeGlu,
+    // Placeholder for no activation; not implemented in codegen
+    None,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -137,7 +139,10 @@ struct GemmGatedActOptions : public gemm::GemmOptions
 inline bool checkAndUpdateGemmGatedActOptions(
     gemmGatedAct::GemmGatedActOptions& options, tg::CudaArch cudaArch, bool updateOptions = true)
 {
-
+    if (options.mActType == gemmGatedAct::ActType::None)
+    {
+        TLLM_CHECK_ERROR(false, "ActType None is not supported");
+    }
     // tmpOut is already transposed at this stage
     auto const hiddenSizeStr = options.mTransposeMmaOutput ? "M" : "N";
     auto const hiddenSize = options.mTransposeMmaOutput ? options.mM : options.mN;
@@ -145,8 +150,8 @@ inline bool checkAndUpdateGemmGatedActOptions(
 
     TLLM_CHECK_ERROR(hiddenSize % 2 == 0, hiddenSizeStr, " must be a multiple of 2.");
 
-    TLLM_CHECK_ERROR((options.mTransposeMmaOutput ^ options.mUseShuffledMatrixA) == 0,
-        "Transpose mma output can only be used with shuffled A matrix. And vice versa.");
+    TLLM_CHECK_ERROR((options.mTransposeMmaOutput && !options.mUseShuffledMatrix) == false,
+        "Transpose mma output can only be used with shuffled matrix.");
 
     if (options.mUseTmaStore)
     {
@@ -178,12 +183,12 @@ inline bool checkAndUpdateGemmGatedActOptions(
     }
 
     //
-    if (options.mUseShuffledMatrixA)
+    if (options.mUseShuffledMatrix)
     {
         auto const shuffleBlockSize = gemm::getShuffleBlockSize(options.mEpilogueTileM);
         TLLM_CHECK_ERROR(hiddenSize % (2 * shuffleBlockSize) == 0 && validHiddenSize % (2 * shuffleBlockSize) == 0,
             "M/validM must be a multiple of 2 * shuffle block size (", 2 * shuffleBlockSize,
-            ") when useShuffledMatrixA");
+            ") when useShuffledMatrix");
     }
     if (options.mNumSlicesForSplitK > 1)
     {

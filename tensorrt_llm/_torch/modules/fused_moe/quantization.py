@@ -99,12 +99,17 @@ def trtllmgen_maybe_get_cached_w3_w1_permute_indices(
         cache_permute_indices: Dict[tuple[tuple[int, int, int], str],
                                     torch.Tensor],
         epilogue_tile_m: int,
-        num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
+        num_elts_per_sf: Union[None, int] = None,
+        is_gated_act_gemm: bool = True) -> torch.Tensor:
     key = (dst_w3_w1_weight.shape, "w31", int(num_elts_per_sf or -1))
+
     if key not in cache_permute_indices:
         # Get permute indices and chain them together
-        permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
-            dst_w3_w1_weight)
+        if is_gated_act_gemm:
+            permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
+                dst_w3_w1_weight)
+        else:
+            permute0 = torch.arange(dst_w3_w1_weight.shape[0], dtype=torch.long)
         if num_elts_per_sf is None:
             permute1 = get_shuffle_matrix_a_row_indices(
                 dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m)
@@ -2471,6 +2476,26 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor):
+        # For non-gated activations, w3 may be None or empty
+        assert w1_weight is not None, "w1_weight must not be None"
+        if module.is_gated_activation:
+            assert w3_weight is not None, "w3_weight must not be None for gated activation"
+            if w1_weight.numel() == 0 or w3_weight.numel() == 0:
+                logger.error(
+                    f"Empty weight tensor detected! w1: {w1_weight.shape}, w3: {w3_weight.shape}"
+                )
+                raise ValueError(
+                    f"Empty weight tensor detected for expert load. w1: {w1_weight.shape}, w3: {w3_weight.shape}"
+                )
+        else:
+            # For non-gated, w3 should be None or empty
+            if w1_weight.numel() == 0:
+                logger.error(
+                    f"Empty w1 weight tensor detected! w1: {w1_weight.shape}")
+                raise ValueError(
+                    f"Empty w1 weight tensor detected for expert load. w1: {w1_weight.shape}"
+                )
+
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
         dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
@@ -2481,21 +2506,39 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
 
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
 
-        # Keep weights in device buffer
-        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
-            module.intermediate_size_per_partition, dim=0)
+        # Handle gated vs non-gated activations
+        if module.is_gated_activation:
+            # Gated activation: buffer contains both w3 and w1
+            w3_weight_shard = load_weight_shard(w3_weight,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
 
-        dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
-        dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+            if dst_w3_w1_weight_gpu.shape[
+                    0] != module.intermediate_size_per_partition * 2:
+                # If padded, we can't just use split directly if we want to fill the padded area correctly or ignore it.
+                # But here we just want to fill the first N rows.
+                dst_w3_weight = dst_w3_w1_weight_gpu.narrow(
+                    0, 0, module.intermediate_size_per_partition)
+                dst_w1_weight = dst_w3_w1_weight_gpu.narrow(
+                    0, module.intermediate_size_per_partition,
+                    module.intermediate_size_per_partition)
+            else:
+                # Keep weights in device buffer
+                dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
+                    module.intermediate_size_per_partition, dim=0)
+
+            dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
+            dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+        else:
+            # Non-gated activation (e.g., ReLU2): buffer only contains w1
+            dst_w3_w1_weight_gpu.copy_(
+                w1_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
 
         # Get permute indices
         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
@@ -2571,20 +2614,38 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        # Keep weights in device buffer
-        # w3
-        dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
-            dim=0, start=0, length=module.intermediate_size_per_partition)
-        dst_w3_weight_scale.copy_(
-            w3_weight_scale.view(dst_w3_weight_scale.dtype))
 
-        # w1
-        dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
-            dim=0,
-            start=module.intermediate_size_per_partition,
-            length=module.intermediate_size_per_partition)
-        dst_w1_weight_scale.copy_(
-            w1_weight_scale.view(dst_w1_weight_scale.dtype))
+        # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
+        w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0
+
+        # Keep weights in device buffer
+        if module.is_gated_activation:
+            # Gated activation: buffer contains both w3 and w1 scales
+            # w3
+            dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
+                dim=0, start=0, length=module.intermediate_size_per_partition)
+
+            # w1
+            dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
+                dim=0,
+                start=module.intermediate_size_per_partition,
+                length=module.intermediate_size_per_partition)
+
+            if w3_size == 0:
+                # Special case: w3 is empty (shouldn't happen for gated activation)
+                dst_w3_weight_scale.zero_()
+                dst_w1_weight_scale.copy_(
+                    w1_weight_scale.view(dst_w1_weight_scale.dtype))
+            else:
+                # Normal case: both w3 and w1 scales are present
+                dst_w3_weight_scale.copy_(
+                    w3_weight_scale.view(dst_w3_weight_scale.dtype))
+                dst_w1_weight_scale.copy_(
+                    w1_weight_scale.view(dst_w1_weight_scale.dtype))
+        else:
+            # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
+            dst_w3_w1_weight_scale_gpu.copy_(
+                w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
 
         orig_shape = dst_w3_w1_weight_scale_gpu.shape
 
@@ -2668,9 +2729,21 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         super().load_quant_scales(module, weights)
 
         # last step: load fc31_scale_c
-        module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
-                                       module.fc31_alpha.data,
-                                       non_blocking=True)
+        # c_global_sf: fc2_input_scale
+        # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
+        # For non-gated activations (Relu2), scale_c_fc1 is just the input scale
+        from ...utils import ActivationType
+        if hasattr(module, 'activation_type'
+                   ) and module.activation_type == ActivationType.Relu2:
+            # For Relu2: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
+            module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
+                module.expert_size_per_partition),
+                                           non_blocking=True)
+        else:
+            # For SwiGlu (default): scale_c_fc1 = fc2_input_scale * fc31_alpha
+            module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
+                                           module.fc31_alpha.data,
+                                           non_blocking=True)
 
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
@@ -2777,54 +2850,77 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                  w1_weight: torch.Tensor,
                                  w3_weight: torch.Tensor,
                                  dst_w3_w1_weight: torch.Tensor):
+        # Allow None or empty for robustness
+        if w1_weight is None and w3_weight is None:
+            return
+
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
         dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
         )
 
-        alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size, w1_weight.shape[0])
-        if len(w1_weight.shape) == 2:
-            # Pad weights
-            # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
-            assert w1_weight.dtype == torch.uint8
-            w1_weight = maybe_pad_for_mxfp4(w1_weight,
-                                            self.input_hidden_alignment // 2,
-                                            alignment)
-            assert w3_weight.dtype == torch.uint8
-            w3_weight = maybe_pad_for_mxfp4(w3_weight,
-                                            self.input_hidden_alignment // 2,
-                                            alignment)
+        target_inter_size = module.intermediate_size_per_partition
+
+        # Helper to get shard
+        def get_shard(weight_tensor):
+            if weight_tensor is None or weight_tensor.numel() == 0:
+                return None
+            if weight_tensor.shape[0] == target_inter_size:
+                return weight_tensor.to(device)
+            elif weight_tensor.shape[0] > target_inter_size:
+                return load_weight_shard(weight_tensor,
+                                         module.tp_size,
+                                         module.tp_rank,
+                                         TensorParallelMode.COLUMN,
+                                         device=device)
+            else:
+                logger.warning(
+                    f"Weight shape {weight_tensor.shape} smaller than target {target_inter_size}. Using as is."
+                )
+                return weight_tensor.to(device)
+
+        w1_shard = get_shard(w1_weight)
+        w3_shard = get_shard(w3_weight)
+
+        # Handle gated vs non-gated activations
+        if module.is_gated_activation:
+            # Gated activation: buffer contains both w3 and w1
+            # Handle dst split (with padding support)
+            if dst_w3_w1_weight_gpu.shape[0] != target_inter_size * 2:
+                dst_w3_weight = dst_w3_w1_weight_gpu.narrow(
+                    0, 0, target_inter_size)
+                dst_w1_weight = dst_w3_w1_weight_gpu.narrow(
+                    0, target_inter_size, target_inter_size)
+            else:
+                dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
+                    target_inter_size, dim=0)
+
+            # Copy W1
+            if w1_shard is not None:
+                dst_w1_weight.copy_(w1_shard.view(dst_w1_weight.dtype))
+
+            # Copy W3 (or duplicate W1 if W3 is missing)
+            if w3_shard is not None:
+                dst_w3_weight.copy_(w3_shard.view(dst_w3_weight.dtype))
+            elif w1_shard is not None:
+                logger.warning(
+                    "w3_weight is empty. Duplicating w1_weight to w3 to satisfy Gated kernel requirements."
+                )
+                # dst_w3_weight.copy_(w1_shard.view(dst_w3_weight.dtype))
         else:
-            # Pad bias, TRTLLM backend expects float32 bias.
-            assert len(w1_weight.shape) == 1
-            assert len(w3_weight.shape) == 1
-            w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment).float()
-            w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment).float()
-
-        w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
-        w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
-
-        # FIXME: this depends on the kernel internals
-        epilogue_tile_m = 128
-
-        # Keep weights in device buffer
-        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.chunk(2, dim=0)
-        dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
-        dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
+            # Non-gated activation (e.g., ReLU2): buffer only contains w1
+            if w1_shard is not None:
+                dst_w3_w1_weight_gpu.copy_(
+                    w1_shard.view(dst_w3_w1_weight_gpu.dtype))
+            else:
+                logger.error("w1_weight is missing for non-gated activation")
 
         # Get permute indices
         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
-            dst_w3_w1_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
+            dst_w3_w1_weight_gpu,
+            self._cache_permute_indices,
+            128,
+            is_gated_act_gemm=module.is_gated_activation)  # epilogue_tile_m=128
 
         # Shuffle the weight according to permute indices
         processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
@@ -2926,13 +3022,30 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
+
+        # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
+        w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0
         # Keep weights in device buffer
-        dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.chunk(
-            2, dim=0)
-        dst_w3_weight_scale.copy_(
-            w3_weight_scale.view(dst_w3_weight_scale.dtype))
-        dst_w1_weight_scale.copy_(
-            w1_weight_scale.view(dst_w1_weight_scale.dtype))
+        if module.is_gated_activation:
+            # Gated activation: buffer contains both w3 and w1 scales
+            dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.chunk(
+                2, dim=0)
+
+            if w3_size == 0:
+                # Special case: w3 is empty (shouldn't happen for gated activation)
+                dst_w3_weight_scale.zero_()
+                dst_w1_weight_scale.copy_(
+                    w1_weight_scale.view(dst_w1_weight_scale.dtype))
+            else:
+                # Normal case: both w3 and w1 scales are present
+                dst_w3_weight_scale.copy_(
+                    w3_weight_scale.view(dst_w3_weight_scale.dtype))
+                dst_w1_weight_scale.copy_(
+                    w1_weight_scale.view(dst_w1_weight_scale.dtype))
+        else:
+            # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
+            dst_w3_w1_weight_scale_gpu.copy_(
+                w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
 
         orig_shape = dst_w3_w1_weight_scale_gpu.shape
 
@@ -2944,7 +3057,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype),
             self._cache_permute_indices,
             epilogue_tile_m,
-            num_elts_per_sf=num_elts_per_sf)
+            num_elts_per_sf=num_elts_per_sf,
+            is_gated_act_gemm=module.is_gated_activation)
 
         # Shuffle the weight according to permute indices
         w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(

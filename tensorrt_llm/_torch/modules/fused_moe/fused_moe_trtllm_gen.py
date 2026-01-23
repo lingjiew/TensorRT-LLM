@@ -16,7 +16,7 @@ from ...custom_ops.trtllm_gen_custom_ops import \
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 
 # isort: off
@@ -82,6 +82,7 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -99,6 +100,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
+            activation_type=activation_type,
         )
 
         sm_version = get_sm_version()
@@ -224,7 +226,7 @@ class TRTLLMGenFusedMoE(MoE):
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod(
-                ) if self.swiglu_alpha is not None else NVFP4TRTLLMGenFusedMoEBaseMethod(
+                ) if self.swiglu_alpha is not None or self.activation_type == ActivationType.Relu2 else NVFP4TRTLLMGenFusedMoEBaseMethod(
                 )
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
@@ -450,9 +452,10 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_ids=token_selected_experts,
             )
         elif self.has_nvfp4:
-            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
-                -2] // 2
-
+            # Pass intermediate_size_per_partition directly (for both gated and non-gated)
+            # C++ will validate against both gemm1 and gemm2 weight shapes
+            intermediate_size_per_partition_padded = self.intermediate_size_per_partition
+            act_type = 1 if self.activation_type == ActivationType.Relu2 else 0
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -480,6 +483,7 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
+                act_type=act_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
             )
@@ -552,7 +556,7 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
-                act_type=0,
+                act_type=act_type,
                 topk_ids=token_selected_experts,
                 topk_weights=token_final_scales,
             )
