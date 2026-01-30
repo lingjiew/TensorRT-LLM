@@ -166,9 +166,10 @@ def extract_transpose_xbc_prefill_smart(
     """
     # For small inputs, fixed block sizes are often more efficient
     # For large inputs, autotuning can find better configurations
-    if use_autotune and num_prefill_tokens * conv_dim >= autotune_threshold:
-        return extract_transpose_xbc_prefill_autotuned(
-            zxbcdt, num_prefill_tokens, d_inner, conv_dim
-        )
-    else:
-        return extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
+    return extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
+    # if use_autotune and num_prefill_tokens * conv_dim >= autotune_threshold:
+    #     return extract_transpose_xbc_prefill_autotuned(
+    #         zxbcdt, num_prefill_tokens, d_inner, conv_dim
+    #     )
+    # else:
+    #     return extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
