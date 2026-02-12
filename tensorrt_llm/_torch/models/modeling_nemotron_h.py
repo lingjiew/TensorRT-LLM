@@ -274,6 +274,8 @@ class NemotronHMOE(nn.Module):
 
             routed_hidden_states = hidden_states
             if self.use_latent_moe:
+                if isinstance(routed_hidden_states, Fp4QuantizedTensor):
+                    routed_hidden_states = hidden_states_hp_2d
                 routed_hidden_states = self.fc1_latent_proj(
                     routed_hidden_states)
 
