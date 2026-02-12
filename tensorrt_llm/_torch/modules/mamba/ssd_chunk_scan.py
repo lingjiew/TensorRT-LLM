@@ -748,7 +748,7 @@ def _chunk_scan_fwd(
         True,
         D is not None,
         D.dim() == 2 if D is not None else True,
-        BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
+        BLOCK_SIZE_DSTATE=32, #BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         HAS_Z=z is not None,
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
